@@ -16,11 +16,16 @@ public class PdfiumCore {
     private static final String TAG = PdfiumCore.class.getName();
 
     static {
+
+        System.loadLibrary("modpng");
+        System.loadLibrary("modft2");
         System.loadLibrary("modpdfium");
         System.loadLibrary("jniPdfium");
     }
 
     private native long nativeOpenDocument(int fd, String password);
+
+    private native long nativeOpenMemDocument(byte[] data, String password);
 
     private native void nativeCloseDocument(long docPtr);
 
@@ -108,6 +113,18 @@ public class PdfiumCore {
         return document;
     }
 
+    public PdfDocument newDocument(byte[] data) throws IOException {
+        return newDocument(data, null);
+    }
+
+    public PdfDocument newDocument(byte[] data, String password) throws IOException {
+        PdfDocument document = new PdfDocument();
+        synchronized (lock) {
+            document.mNativeDocPtr = nativeOpenMemDocument(data, password);
+        }
+        return document;
+    }
+
     public int getPageCount(PdfDocument doc) {
         synchronized (lock) {
             return nativeGetPageCount(doc.mNativeDocPtr);
@@ -180,8 +197,7 @@ public class PdfiumCore {
     }
 
     public void renderPage(PdfDocument doc, Surface surface, int pageIndex,
-                           int startX, int startY, int drawSizeX, int drawSizeY)
-    {
+                           int startX, int startY, int drawSizeX, int drawSizeY) {
         renderPage(doc, surface, pageIndex, startX, startY, drawSizeX, drawSizeY, false);
     }
 
@@ -234,12 +250,14 @@ public class PdfiumCore {
 
             nativeCloseDocument(doc.mNativeDocPtr);
 
-            try {
-                doc.parcelFileDescriptor.close();
-            } catch (IOException e) {
+            if (doc.parcelFileDescriptor != null) { //if document was loaded from file
+                try {
+                    doc.parcelFileDescriptor.close();
+                } catch (IOException e) {
                 /* ignore */
+                }
+                doc.parcelFileDescriptor = null;
             }
-            doc.parcelFileDescriptor = null;
         }
     }
 

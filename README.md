@@ -1,5 +1,5 @@
 # Pdfium Android binding with Bitmap rendering
-Use pdfium library [from AOSP](https://android.googlesource.com/platform/external/pdfium/)
+Uses pdfium library [from AOSP](https://android.googlesource.com/platform/external/pdfium/)
 
 The demo app (for not modified lib) is [here](https://github.com/mshockwave/PdfiumAndroid-Demo-App)
 
@@ -7,13 +7,13 @@ Forked for use with [AndroidPdfViewer](https://github.com/barteksc/AndroidPdfVie
 
 API is highly compatible with original version, only additional methods were created.
 
-## What's new in 1.4.0?
-* merge pull request by [usef](https://github.com/usef) with added support for rendering annotations. Due to limitations of _Pdfium_, messages from comments cannot be read and are rendered only as speech balloons.
+## What's new in 1.7.0?
+* Add rendering bitmap in RGB 565 format, which reduces memory usage (about twice)
 
 ## Installation
 Add to _build.gradle_:
 
-`compile 'com.github.barteksc:pdfium-android:1.4.0'`
+`compile 'com.github.barteksc:pdfium-android:1.7.0'`
 
 Library is available in jcenter and Maven Central repositories.
 
@@ -32,10 +32,14 @@ void openPdf() {
         int width = pdfiumCore.getPageWidthPoint(pdfDocument, pageNum);
         int height = pdfiumCore.getPageHeightPoint(pdfDocument, pageNum);
 
+        // ARGB_8888 - best quality, high memory usage, higher possibility of OutOfMemoryError
+        // RGB_565 - little worse quality, twice less memory usage
         Bitmap bitmap = Bitmap.createBitmap(width, height,
-                Bitmap.Config.ARGB_8888);
+                Bitmap.Config.RGB_565);
         pdfiumCore.renderPageBitmap(pdfDocument, bitmap, pageNum, 0, 0,
                 width, height);
+        //if you need to render annotations and form fields, you can use
+        //the same method above adding 'true' as last param
 
         iv.setImageBitmap(bitmap);
 

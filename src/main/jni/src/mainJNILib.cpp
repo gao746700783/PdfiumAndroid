@@ -15,7 +15,7 @@ extern "C" {
 using namespace android;
 
 #include <fpdfview.h>
-#include <fpdfdoc.h>
+#include <fpdf_doc.h>
 #include <string>
 
 static Mutex sLibraryLock;
@@ -26,7 +26,7 @@ static void initLibraryIfNeed(){
     Mutex::Autolock lock(sLibraryLock);
     if(sLibraryReferenceCount == 0){
         LOGD("Init FPDF library");
-        FPDF_InitLibrary(NULL);
+        FPDF_InitLibrary();
     }
     sLibraryReferenceCount++;
 }
@@ -39,6 +39,12 @@ static void destroyLibraryIfNeed(){
         FPDF_DestroyLibrary();
     }
 }
+
+struct rgb {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+};
 
 class DocumentFile {
     private:
@@ -135,6 +141,25 @@ jobject NewLong(JNIEnv* env, jlong value) {
     return env->NewObject(cls, methodID, value);
 }
 
+uint16_t rgbTo565(rgb *color) {
+    return ((color->red >> 3) << 11) | ((color->green >> 2) << 5) | (color->blue >> 3);
+}
+
+void rgbBitmapTo565(void *source, int sourceStride, void *dest, AndroidBitmapInfo *info) {
+    rgb *srcLine;
+    uint16_t *dstLine;
+    int y, x;
+    for (y = 0; y < info->height; y++) {
+        srcLine = (rgb*) source;
+        dstLine = (uint16_t*) dest;
+        for (x = 0; x < info->width; x++) {
+            dstLine[x] = rgbTo565(&srcLine[x]);
+        }
+        source = (char*) source + sourceStride;
+        dest = (char*) dest + info->stride;
+    }
+}
+
 extern "C" { //For JNI support
 
 static int getBlock(void* param, unsigned long position, unsigned char* outBuffer,
@@ -198,6 +223,49 @@ JNI_FUNC(jlong, PdfiumCore, nativeOpenDocument)(JNI_ARGS, jint fd, jstring passw
     return reinterpret_cast<jlong>(docFile);
 }
 
+JNI_FUNC(jlong, PdfiumCore, nativeOpenMemDocument)(JNI_ARGS, jbyteArray data, jstring password){
+    DocumentFile *docFile = new DocumentFile();
+
+    const char *cpassword = NULL;
+    if(password != NULL) {
+        cpassword = env->GetStringUTFChars(password, NULL);
+    }
+
+    jbyte *cData = env->GetByteArrayElements(data, NULL);
+    int size = (int) env->GetArrayLength(data);
+    jbyte *cDataCopy = new jbyte[size];
+    memcpy(cDataCopy, cData, size);
+    FPDF_DOCUMENT document = FPDF_LoadMemDocument( reinterpret_cast<const void*>(cDataCopy),
+                                                          size, cpassword);
+    env->ReleaseByteArrayElements(data, cData, JNI_ABORT);
+
+    if(cpassword != NULL) {
+        env->ReleaseStringUTFChars(password, cpassword);
+    }
+
+    if (!document) {
+        delete docFile;
+
+        const long errorNum = FPDF_GetLastError();
+        if(errorNum == FPDF_ERR_PASSWORD) {
+            jniThrowException(env, "com/shockwave/pdfium/PdfPasswordException",
+                                    "Password required or incorrect password.");
+        } else {
+            char* error = getErrorDescription(errorNum);
+            jniThrowExceptionFmt(env, "java/io/IOException",
+                                    "cannot create document: %s", error);
+
+            free(error);
+        }
+
+        return -1;
+    }
+
+    docFile->pdfDocument = document;
+
+    return reinterpret_cast<jlong>(docFile);
+}
+
 JNI_FUNC(jint, PdfiumCore, nativeGetPageCount)(JNI_ARGS, jlong documentPtr){
     DocumentFile *doc = reinterpret_cast<DocumentFile*>(documentPtr);
     return (jint)FPDF_GetPageCount(doc->pdfDocument);
@@ -214,7 +282,11 @@ static jlong loadPageInternal(JNIEnv *env, DocumentFile *doc, int pageIndex){
 
         FPDF_DOCUMENT pdfDoc = doc->pdfDocument;
         if(pdfDoc != NULL){
-            return reinterpret_cast<jlong>( FPDF_LoadPage(pdfDoc, pageIndex) );
+            FPDF_PAGE page = FPDF_LoadPage(pdfDoc, pageIndex);
+            if (page == NULL) {
+                throw "Loaded page is null";
+            }
+            return reinterpret_cast<jlong>(page);
         }else{
             throw "Get page pdf document null";
         }
@@ -299,7 +371,7 @@ static void renderPageInternal( FPDF_PAGE page,
 
     if(drawSizeHor < canvasHorSize || drawSizeVer < canvasVerSize){
         FPDFBitmap_FillRect( pdfBitmap, 0, 0, canvasHorSize, canvasVerSize,
-                             0x84, 0x84, 0x84, 255); //Gray
+                             0x848484FF); //Gray
     }
 
     int baseHorSize = (canvasHorSize < drawSizeHor)? canvasHorSize : drawSizeHor;
@@ -313,7 +385,7 @@ static void renderPageInternal( FPDF_PAGE page,
     }
 
     FPDFBitmap_FillRect( pdfBitmap, baseX, baseY, baseHorSize, baseVerSize,
-                         255, 255, 255, 255); //White
+                         0xFFFFFFFF); //White
 
     FPDF_RenderPageBitmap( pdfBitmap, page,
                            startX, startY,
@@ -384,8 +456,8 @@ JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobj
     int canvasHorSize = info.width;
     int canvasVerSize = info.height;
 
-    if(info.format != ANDROID_BITMAP_FORMAT_RGBA_8888){
-        LOGE("Bitmap format must be RGBA_8888");
+    if(info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 && info.format != ANDROID_BITMAP_FORMAT_RGB_565){
+        LOGE("Bitmap format must be RGBA_8888 or RGB_565");
         return;
     }
 
@@ -395,9 +467,21 @@ JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobj
         return;
     }
 
+    void *tmp;
+    int format;
+    int sourceStride;
+    if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
+        tmp = malloc(canvasVerSize * canvasHorSize * sizeof(rgb));
+        sourceStride = canvasHorSize * sizeof(rgb);
+        format = FPDFBitmap_BGR;
+    } else {
+        tmp = addr;
+        sourceStride = info.stride;
+        format = FPDFBitmap_BGRA;
+    }
+
     FPDF_BITMAP pdfBitmap = FPDFBitmap_CreateEx( canvasHorSize, canvasVerSize,
-                                                     FPDFBitmap_BGRA,
-                                                     addr, info.stride);
+                                                     format, tmp, sourceStride);
 
     /*LOGD("Start X: %d", startX);
     LOGD("Start Y: %d", startY);
@@ -408,7 +492,7 @@ JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobj
 
     if(drawSizeHor < canvasHorSize || drawSizeVer < canvasVerSize){
         FPDFBitmap_FillRect( pdfBitmap, 0, 0, canvasHorSize, canvasVerSize,
-                             0x84, 0x84, 0x84, 255); //Gray
+                             0x848484FF); //Gray
     }
 
     int baseHorSize = (canvasHorSize < drawSizeHor)? canvasHorSize : (int)drawSizeHor;
@@ -422,12 +506,17 @@ JNI_FUNC(void, PdfiumCore, nativeRenderPageBitmap)(JNI_ARGS, jlong pagePtr, jobj
     }
 
     FPDFBitmap_FillRect( pdfBitmap, baseX, baseY, baseHorSize, baseVerSize,
-                         255, 255, 255, 255); //White
+                         0xFFFFFFFF); //White
 
     FPDF_RenderPageBitmap( pdfBitmap, page,
                            startX, startY,
                            (int)drawSizeHor, (int)drawSizeVer,
                            0, flags );
+
+    if (info.format == ANDROID_BITMAP_FORMAT_RGB_565) {
+        rgbBitmapTo565(tmp, sourceStride, addr, &info);
+        free(tmp);
+    }
 
     AndroidBitmap_unlockPixels(env, bitmap);
 }
@@ -446,7 +535,7 @@ JNI_FUNC(jstring, PdfiumCore, nativeGetDocumentMetaText)(JNI_ARGS, jlong docPtr,
     std::wstring text;
     FPDF_GetMetaText(doc->pdfDocument, ctag, WriteInto(&text, buffer_bytes + 1), buffer_bytes);
     env->ReleaseStringUTFChars(tag, ctag);
-    return env->NewString((jchar*) text.c_str(), buffer_bytes / 2 - 2);
+    return env->NewString((jchar*) text.c_str(), buffer_bytes / 2 - 1);
 }
 
 JNI_FUNC(jobject, PdfiumCore, nativeGetFirstChildBookmark)(JNI_ARGS, jlong docPtr, jobject bookmarkPtr) {
